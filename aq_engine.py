@@ -11,6 +11,8 @@ from torch.nn.parallel.scatter_gather import Gather
 
 from src.aq import QuantizedWeight
 from src.utils import ellipsis
+# 导入 entropy_masker 单例
+from src.entropy_utils import entropy_masker
 
 
 class AQEngine(nn.Module):
@@ -29,10 +31,33 @@ class AQEngine(nn.Module):
 
     @torch.no_grad()
     def add_batch(self, inp: torch.Tensor):
-        """Accumulate a minibatch of layer inputs and update the X.T @ X (aka half hessian)"""
+        """
+        Accumulate a minibatch of layer inputs and update the X.T @ X (aka half hessian).
+        If entropy_masker has a mask, it will be applied automatically.
+        """
         assert self.XTX is not None, "Already ran quantization; cannot add more data batches"
         if len(inp.shape) == 3:
             inp = inp.reshape((-1, inp.shape[-1]))
+        
+        # --- 新增逻辑: 从单例获取并应用 mask ---
+        mask = entropy_masker.get_mask()
+        if mask is not None:
+            # 确保 mask 和 input 的序列长度维度匹配
+            # inp shape: [seq_len, hidden_size], mask shape: [1, seq_len]
+            mask = mask.squeeze(0) # 变为 [seq_len]
+            if mask.shape[0] != inp.shape[0]:
+                 # 在批处理时，输入可能是多个序列拼接而成，需要调整 mask
+                 if inp.shape[0] % mask.shape[0] == 0:
+                     num_repeats = inp.shape[0] // mask.shape[0]
+                     mask = mask.repeat(num_repeats)
+                 else:
+                     raise ValueError(f"Mask shape {mask.shape} is not compatible with input shape {inp.shape}")
+
+            inp = inp[mask] # 只保留高熵 token 对应的行
+            if inp.numel() == 0:
+                return # 如果没有高熵 token，则不进行任何操作
+        # --- 结束 ---
+
         tmp = inp.shape[0]
         inp = inp.t()
 

@@ -13,6 +13,7 @@ from transformers import PreTrainedModel
 from aq_engine import AQEngine
 from src.aq import QuantizedLinear
 from src.datautils import get_loaders
+from src.entropy_utils import entropy_masker # 导入 entropy_masker 单例
 from src.finetune import finetune_groupwise
 from src.modelutils import (
     FALCON_TYPES,
@@ -56,7 +57,8 @@ def quantize_model(model: PreTrainedModel, args: Namespace):
         train_data = data
         val_data = None
 
-    results = quantize_aq(model, train_data, val_data, args)
+    # 将原始的 token_ids 数据也传入 quantize_aq
+    results = quantize_aq(model, train_data, val_data, args, original_tokens=data)
     print(f"quantization time: {time.time() - tick:.1f}")
     return results
 
@@ -162,7 +164,7 @@ def get_inps(
 
 
 @torch.no_grad()
-def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Sequence], args: Namespace):
+def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Sequence], args: Namespace, original_tokens: Sequence):
     assert not torch.backends.cuda.matmul.allow_tf32
     print("\nStarting AQ quantization ...")
     inps, forward_args = get_inps(model, data, args.model_seqlen, args.devices, args.offload_activations)
@@ -190,9 +192,7 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
         stats_payload = {}
         start_time = time.time()
 
-        # quantized layer will return there
         layer_device_original = next(layers[layer_index].parameters()).device
-        # backup layer dtype
         layer_dtype_original = next(layers[layer_index].parameters()).dtype
         print(f"{layer_device_original=}")
         layer = layers[layer_index].to(args.devices[0])
@@ -213,8 +213,7 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                 layer = torch.load(layer_save_path, map_location=args.devices[0])
                 loaded_layer = True
 
-        # prepare validation  outputs
-        if run_validation and not loaded_layer:  # note: if we skip validation, val_outs will still be updated later
+        if run_validation and not loaded_layer:
             if len(args.devices) == 1:
                 assert len(val_inps) == len(val_outs) == 1
                 update_outs(layer, val_inps[0], val_outs[0], compute_mse=not args.skip_out_loss, **forward_args)
@@ -227,8 +226,9 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
             if loaded_layer:
                 print("Skipping quantization: loaded a previously quantized layer")
                 break
+            
             if len(args.devices) == 1:
-                assert len(inps) == len(outs) == 1  # number of per-device inputs/outputs
+                assert len(inps) == len(outs) == 1
                 aq_handlers = init_aq_engines(
                     layer,
                     [
@@ -238,6 +238,8 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                     ],
                     inps[0],
                     outs[0],
+                    use_entropy_masking=args.use_entropy_masking,
+                    original_tokens=original_tokens,
                     **forward_args,
                 )
             else:
@@ -251,8 +253,11 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                     ],
                     inps,
                     outs,
+                    use_entropy_masking=args.use_entropy_masking,
+                    original_tokens=original_tokens,
                     **forward_args,
                 )
+
             for sublayer_name in aq_handlers.keys():
                 print(f"Quantizing module {sublayer_name} of layer {layer_index}")
                 if "mixtral" in model.config.model_type.lower() and args.mix_compression:
@@ -267,7 +272,7 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                 with torch.no_grad():
                     assert aq_handlers[sublayer_name].layer.weight in set(
                         layer.parameters()
-                    )  # test that this is not a replica
+                    )
 
                     new_linear = QuantizedLinear(quantized_weight, aq_handlers[sublayer_name].layer.bias)
                     if args.use_checkpointing:
@@ -278,15 +283,14 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                         for child_name, child_module in submodule.named_children():
                             if child_module is aq_handlers[sublayer_name].layer:
                                 setattr(submodule, child_name, new_linear)
-                                found_original = True  # note: do not break to handle tied layers
-
+                                found_original = True
                     assert found_original, f"could not find {sublayer_name}"
 
                 weight_avg_bits = quantized_weight.estimate_nbits_per_parameter()
                 overall_bits += int(weight_avg_bits * torch.numel(aq_handlers[sublayer_name].layer.weight.data))
                 number_of_quantized_params += torch.numel(aq_handlers[sublayer_name].layer.weight.data)
                 print("curent_avg_bits", overall_bits / number_of_quantized_params)
-                quantizers["model.layers.%d.%s" % (layer_index, sublayer_name)] = ()  # to be updated
+                quantizers["model.layers.%d.%s" % (layer_index, sublayer_name)] = ()
 
             del aq_handlers
             assert not loaded_layer
@@ -313,7 +317,7 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
             print(f"Saving layer {layer_index}... to {layer_save_path}")
             torch.save(layer, layer_save_path)
             if args.on_save:
-                exec(args.on_save)  # a callback e.g. to save progress in slurm or similar distributed infrastructure
+                exec(args.on_save)
 
         should_compute_mse = not (args.skip_out_loss or loaded_layer)
         if len(args.devices) == 1:
@@ -345,7 +349,6 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
         if run_validation:
             val_inps, val_outs = val_outs, val_inps
 
-        # Logging
         stats_payload["layer_time"] = time.time() - start_time
         stats_payload["Step"] = layer_index
         if args.wandb:
@@ -358,11 +361,11 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
         torch.save(vars(args), os.path.join(args.save, "args.pt"))
         save_not_quantized_weights(model, args.save)
         if args.on_save:
-            exec(args.on_save)  # a callback e.g. to save progress in slurm or similar distributed infrastructure
+            exec(args.on_save)
 
     if args.wandb:
         wandb.log({"max_cuda_mem_quantize": round(torch.cuda.max_memory_allocated() / 1e9, 2)})
-        if number_of_quantized_params > 0:  # do not report avg bits if we load all pre-quantized layers via --resume
+        if number_of_quantized_params > 0:
             wandb.log({"Avg_bits": overall_bits / number_of_quantized_params})
     model.config.use_cache = use_cache
     print(f"quantize: {torch.cuda.max_memory_allocated()=:,}")
@@ -430,18 +433,14 @@ def init_aq_engines(
     names: Sequence[str],
     inps_tensor: torch.Tensor,
     outs_tensor: torch.Tensor,
+    use_entropy_masking: bool,
+    original_tokens: Optional[Sequence[torch.Tensor]],
     **forward_args: Dict[str, Any],
 ) -> Dict[str, AQEngine]:
     """
     Create a dictionary of AQUtil instances for each quantized layer;
     Run forward pass on each sample in inps_tensor; write output activations to outs_tensor (in-plance)
     Accumulate XTX to each one of aq_handlers
-    :param layer: transformer layer with one or more linear layer to be quantized
-    :param names: a list/tuple of string names for linear sub-layers inside :layer: that shall be quantized
-    :param inps_tensor: a tensor of input activations, [nsamples_per_device, seq_len, hidden_size]
-    :param outs_tensor: a tensor to write output activations into, [nsamples_per_device, seq_len, hidden_size]
-    :param forward_args: additional keyword arguments, e.g. attention mask
-    :returns: a dictionary where keys are full layer names and values are AQUtil instances ready to run .quantize
     """
     device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
     all_sublayers = find_sublayers(layer)
@@ -451,21 +450,22 @@ def init_aq_engines(
     for sublayer_name in subset:
         aq_handlers[sublayer_name] = AQEngine(subset[sublayer_name])
 
-    # wrap all quantized sub-layers with a wrapper that accumulates inputs on forward
-    # note: the code below uses wrappers instead of hooks because hooks cause bugs in multi-gpu code
     wrapped_layer_to_hander = {aq_handler.layer: aq_handler for aq_handler in aq_handlers.values()}
     for module in list(layer.modules()):
         for child_name, child in list(module.named_children()):
             if child in wrapped_layer_to_hander:
                 setattr(module, child_name, _LayerWrapperThatAccumulatesXTX(child, wrapped_layer_to_hander[child]))
 
-    # compute output activations and accumulate XTX
     for j in trange(len(inps_tensor), desc="calc outs before quantization", leave=False):
+        if use_entropy_masking:
+            entropy_masker.generate_and_set_mask(original_tokens[j])
+        else:
+            entropy_masker.current_mask = None # 确保在不使用时清空 mask
+
         outs_tensor[j].copy_(
             layer(inps_tensor[j].to(device).unsqueeze(0), **forward_args)[0].view_as(outs_tensor[j]), non_blocking=True
         )
 
-    # remove wrappers
     for module in list(layer.modules()):
         for child_name, child in list(module.named_children()):
             if isinstance(child, _LayerWrapperThatAccumulatesXTX):
@@ -479,6 +479,7 @@ class _LayerWrapperThatAccumulatesXTX(nn.Module):
         self.wrapped_layer, self.aq_handler = layer, aq_handler
 
     def forward(self, input, *args, **kwargs):
+        # The actual masking happens inside add_batch
         self.aq_handler.add_batch(input)
         return self.wrapped_layer(input, *args, **kwargs)
 
@@ -490,16 +491,29 @@ def init_aq_engines_parallel(
     names: Sequence[str],
     inps: Sequence[torch.Tensor],
     outs: Sequence[torch.Tensor],
+    use_entropy_masking: bool,
+    original_tokens: Optional[Sequence[torch.Tensor]],
     **forward_args,
 ):
+    if use_entropy_masking:
+        raise NotImplementedError("Parallel entropy masking is not implemented.")
+    
     """Parallel version of init_aq_engines; works on lists of input/output tensors"""
+    # Split original_tokens across devices, mirroring how `inps` is split
+    nsamples_per_device = (len(original_tokens) - 1) // len(devices) + 1
+    original_tokens_by_device = [
+        original_tokens[i * nsamples_per_device : min((i + 1) * nsamples_per_device, len(original_tokens))]
+        for i in range(len(devices))
+    ]
+
     layer_replicas = torch.nn.parallel.replicate(layer, devices=devices, detach=True)
-    layer_replicas[0] = layer  # this ensures that aq_handlers returned by 0-th replica operate on the main layer
+    layer_replicas[0] = layer
     funcs_by_device = [init_aq_engines for _ in devices]
     inputs_by_device = []
     kwargs_by_device = []
     for i in range(len(devices)):
-        inputs_by_device.append((layer_replicas[i], names, inps[i], outs[i]))
+        # Pass the per-device chunk of original_tokens
+        inputs_by_device.append((layer_replicas[i], names, inps[i], outs[i], use_entropy_masking, original_tokens_by_device[i]))
         kwargs_by_device.append(
             {
                 k: (v.to(devices[i], non_blocking=True) if isinstance(v, torch.Tensor) else v)
@@ -514,10 +528,11 @@ def init_aq_engines_parallel(
         replica_handlers = [device_aq_handlers[key] for device_aq_handlers in aq_handles_by_device]
         replica_nsamples = [replica_handler.nsamples for replica_handler in replica_handlers]
         total_nsamples = sum(replica_nsamples)
-        aq_handler.XTX = sum(
-            (replica_handlers[i].XTX * (replica_nsamples[i] / total_nsamples)).to(devices[0], non_blocking=True)
-            for i in range(len(devices))
-        )
+        if total_nsamples > 0:
+            aq_handler.XTX = sum(
+                (replica_handlers[i].XTX * (replica_nsamples[i] / total_nsamples)).to(devices[0], non_blocking=True)
+                for i in range(len(devices))
+            )
         aq_handler.nsamples = total_nsamples
     return aq_handlers
 
@@ -528,13 +543,6 @@ def update_outs(
 ) -> Sequence[float]:
     """
     Update outs_tensor with new activations and optionally compute sample-wise mse loss with previous activations
-    :param layer: transformer layer with one or more linear layer to be quantized
-    :param inps_tensor: a tensor of input activations, [nsamples_per_device, seq_len, hidden_size]
-    :param outs_tensor: a tensor to write output activations into, [nsamples_per_device, seq_len, hidden_size]
-    :note: outs_tensor must contain previous activations with which to compute MSE loss
-    :param compute_mse: if True, return a list of sample-wise mse losses; if False, return an empty sequence
-    :param forward_args: additional keyword arguments, e.g. attention mask
-    :returns: a list of mean squared errors for each sequence
     """
     device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
     out_losses = []
@@ -593,7 +601,7 @@ def main():
     parser.add_argument(
         "dataset",
         type=str,
-        help="Dataset name [c4, pajama] or path to data where to extract calibration data from.",
+        help="Dataset name [c4, pajama, openmathreasoning] or path to data where to extract calibration data from.",
     )
     parser.add_argument(
         "--new_eval",
@@ -836,6 +844,25 @@ def main():
         action="store_true",
         help="Whether to trust remote code.",
     )
+    # 新增的命令行参数
+    parser.add_argument(
+        "--use_entropy_masking",
+        action="store_true",
+        help="Enable entropy-based masking for XTX calculation."
+    )
+    parser.add_argument(
+        "--entropy_fixed_threshold",
+        type=float,
+        default=None,
+        help="Fixed entropy threshold for masking. Used if --use_entropy_masking is set."
+    )
+    parser.add_argument(
+        "--entropy_percentile_threshold",
+        type=float,
+        default=None,
+        help="Percentile entropy threshold for masking. Used if --use_entropy_masking is set."
+    )
+
 
     torch.set_num_threads(min(16, torch.get_num_threads()))
     torch.backends.cudnn.allow_tf32 = False
@@ -853,7 +880,13 @@ def main():
         args.devices = [torch.device(device_str) for device_str in args.devices]
     assert all(isinstance(device, torch.device) for device in args.devices)
 
-    # validate val size
+    # MODIFICATION: Enforce single GPU for entropy masking
+    if args.use_entropy_masking and len(args.devices) > 1:
+        raise ValueError(
+            "Entropy masking feature is currently only supported for single-GPU execution. "
+            "Please specify a single device, e.g., --devices cuda:0"
+        )
+
     if args.nsamples is not None:
         assert args.val_size < args.nsamples, "Number of validation set must be smaller than train + val"
 
@@ -886,6 +919,16 @@ def main():
         attn_implementation=args.attn_implementation,
         trust_remote_code=args.trust_remote_code,
     ).train(False)
+
+    # 配置 entropy_masker
+    if args.use_entropy_masking:
+        print("\n============ Configuring Entropy Masker... ============")
+        entropy_masker.configure(
+            model_name=args.model_path,
+            device=args.devices[0], # 强制使用主设备
+            fixed_threshold=args.entropy_fixed_threshold,
+            percentile_threshold=args.entropy_percentile_threshold
+        )
 
     if not args.load and not args.no_quant:
         print("\n============ Quantizing model... ============")

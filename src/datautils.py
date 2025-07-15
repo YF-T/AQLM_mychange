@@ -174,6 +174,74 @@ def get_c4_new(nsamples, seqlen, tokenizer, eval_mode=False):
         return valenc
 
 
+def get_openmathreasoning(nsamples, seqlen, tokenizer, eval_mode=False):
+    """
+    Loads and processes the nvidia/OpenMathReasoning dataset for calibration.
+    
+    Args:
+        nsamples (int): The number of calibration samples to generate.
+        seqlen (int): The target sequence length for each sample.
+        tokenizer: The Hugging Face tokenizer to use for encoding text.
+        eval_mode (bool): Not used here, for interface consistency only.
+
+    Returns:
+        list: A list of PyTorch tensors, each with the shape [1, seqlen].
+    """
+    if eval_mode:
+        raise NotImplementedError("get_openmathreasoning function does not support evaluation mode.")
+
+    print("Loading dataset from nvidia/OpenMathReasoning...")
+    # Load only the training split for calibration
+    dataset = load_dataset("nvidia/OpenMathReasoning", split="train")
+
+    trainloader = []
+    # Use trange for a progress bar, consistent with other functions in the project
+    for _ in trange(nsamples, desc="Building OpenMathReasoning calibration set", leave=False):
+        while True:
+            # Select a random data point
+            i = random.randint(0, len(dataset) - 1)
+            sample = dataset[i]
+            
+            question = sample.get('question')
+            solution_dict = sample.get('solution')
+
+            # Ensure both question and answer are valid
+            if not question or not solution_dict or not solution_dict.get('generated_solution'):
+                continue
+            
+            answer = solution_dict['generated_solution']
+
+            # Step 1: Use the tokenizer's chat template to format and concatenate the question and answer, then tokenize
+            messages = [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": answer},
+            ]
+            
+            tokenized_chat = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=False, # We don't need a generation prompt at the end
+                return_tensors="pt"
+            )
+
+            # Step 2: Check length and construct the dataset
+            # If the total length is less than seqlen, skip this data point
+            if tokenized_chat.shape[1] < seqlen:
+                continue
+
+            # If the length is sufficient, truncate to [1, seqlen]
+            inp = tokenized_chat[:, :seqlen]
+            
+            # Assert to ensure the shape is correct
+            assert inp.shape[1] == seqlen, f"Sequence length mismatch, expected {seqlen}, got {inp.shape[1]}"
+
+            trainloader.append(inp)
+            # After successfully generating a sample, break out of the inner while loop
+            break
+            
+    return trainloader
+
+
 def get_loaders(
     name,
     nsamples=128,
@@ -188,7 +256,7 @@ def get_loaders(
     Loads and prepares data for a Transformers model.
     Args:
         name (str): The name of the dataset to load.
-        This can be one of 'wikitext2', 'c4', 'ptb','pajama' for datasets loaded from Huggingface datasets,
+        This can be one of 'wikitext2', 'c4', 'ptb','pajama', 'openmathreasoning' for datasets loaded from Huggingface datasets,
         or 'none' for cases where a dataset is not needed, like RTN. It can also accept data path to custom file.
         nsamples (int, optional): The number of samples to load from the dataset. Defaults to 128.
         seed (int, optional): The random seed value for data shuffling and splitting. Defaults to 0.
@@ -220,7 +288,7 @@ def get_loaders(
         except FileNotFoundError:
             raise FileNotFoundError(
                 f"Failed to load custom data from {name}.",
-                "Check data path or use one of [c4, wikitext2, ptb, pajama, none]",
+                "Check data path or use one of [c4, wikitext2, ptb, pajama, openmathreasoning, none]",
             )
     else:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -239,10 +307,12 @@ def get_loaders(
             data = get_c4(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
         elif name.lower() == "c4_new":
             data = get_c4_new(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
+        elif name.lower() == "openmathreasoning":
+            data = get_openmathreasoning(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
         else:
             raise ValueError(
                 f"Failed to load data from {name}.",
-                "Check dataset name or path or use one of [c4, wikitext2, ptb, pajama, none]",
+                "Check dataset name or path or use one of [c4, wikitext2, ptb, pajama, openmathreasoning, none]",
             )
 
     if hasattr(data, "input_ids"):
