@@ -2,6 +2,7 @@ import os
 import random
 from itertools import chain
 from typing import Optional, Sequence
+import json
 
 import numpy as np
 import torch
@@ -10,7 +11,8 @@ from datasets import load_dataset
 from torch import nn
 from tqdm import trange
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch.nn.functional as F
 
 
 def set_seed(seed: Optional[int]):
@@ -174,72 +176,66 @@ def get_c4_new(nsamples, seqlen, tokenizer, eval_mode=False):
         return valenc
 
 
-def get_openmathreasoning(nsamples, seqlen, tokenizer, eval_mode=False):
+def get_openmathreasoning(nsamples, seqlen, tokenizer, model_path, trust_remote_code):
     """
-    Loads and processes the nvidia/OpenMathReasoning dataset for calibration.
-    
-    Args:
-        nsamples (int): The number of calibration samples to generate.
-        seqlen (int): The target sequence length for each sample.
-        tokenizer: The Hugging Face tokenizer to use for encoding text.
-        eval_mode (bool): Not used here, for interface consistency only.
-
-    Returns:
-        list: A list of PyTorch tensors, each with the shape [1, seqlen].
+    Loads and processes the nvidia/OpenMathReasoning dataset for calibration,
+    and computes entropy on the fly.
     """
-    if eval_mode:
-        raise NotImplementedError("get_openmathreasoning function does not support evaluation mode.")
-
-    print("Loading dataset from nvidia/OpenMathReasoning...")
-    # Load only the training split for calibration
+    print("Loading and processing dataset from nvidia/OpenMathReasoning...")
     dataset = load_dataset("nvidia/OpenMathReasoning", split="train")
+    
+    # Load a separate model instance for entropy calculation
+    print(f"Loading model for entropy calculation: {model_path}")
+    entropy_model = AutoModelForCausalLM.from_pretrained(model_path, trust_remote_code=trust_remote_code).to("cuda" if torch.cuda.is_available() else "cpu")
+    entropy_model.eval()
 
-    trainloader = []
-    # Use trange for a progress bar, consistent with other functions in the project
-    for _ in trange(nsamples, desc="Building OpenMathReasoning calibration set", leave=False):
+    datalist = []
+    for _ in trange(nsamples, desc="Building OpenMathReasoning calibration set with entropy", leave=False):
         while True:
-            # Select a random data point
             i = random.randint(0, len(dataset) - 1)
             sample = dataset[i]
-            
             question = sample.get('question')
             solution_dict = sample.get('solution')
 
-            # Ensure both question and answer are valid
             if not question or not solution_dict or not solution_dict.get('generated_solution'):
                 continue
             
             answer = solution_dict['generated_solution']
+            messages = [{"role": "user", "content": question}, {"role": "assistant", "content": answer}]
+            tokenized_chat = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False, return_tensors="pt")
 
-            # Step 1: Use the tokenizer's chat template to format and concatenate the question and answer, then tokenize
-            messages = [
-                {"role": "user", "content": question},
-                {"role": "assistant", "content": answer},
-            ]
-            
-            tokenized_chat = tokenizer.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=False, # We don't need a generation prompt at the end
-                return_tensors="pt"
-            )
+            if tokenized_chat.shape[1] >= seqlen:
+                inp = tokenized_chat[:, :seqlen]
+                
+                with torch.no_grad():
+                    outputs = entropy_model(inp.to(entropy_model.device))
+                    logits = outputs.logits
+                    probs = F.softmax(logits, dim=-1)
+                    entropies = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1)
+                
+                datalist.append({'input_ids': inp.cpu(), 'entropies': entropies.cpu()})
+                break
+    del entropy_model
+    torch.cuda.empty_cache()
+    return datalist
 
-            # Step 2: Check length and construct the dataset
-            # If the total length is less than seqlen, skip this data point
-            if tokenized_chat.shape[1] < seqlen:
-                continue
+def get_openmathreasoning_prepared(nsamples, seqlen, filepath, **kwargs):
+    """从预处理的jsonl文件中加载数据"""
+    data = []
+    print(f"Loading prepared dataset from {filepath}...")
+    with open(filepath, 'r', encoding='utf-8') as f:
+        for line in f:
+            if len(data) >= nsamples:
+                break
+            record = json.loads(line)
+            input_ids = torch.tensor(record['input_ids'], dtype=torch.long).unsqueeze(0)
+            entropies = torch.tensor(record['entropies'], dtype=torch.float32).unsqueeze(0)
 
-            # If the length is sufficient, truncate to [1, seqlen]
-            inp = tokenized_chat[:, :seqlen]
-            
-            # Assert to ensure the shape is correct
-            assert inp.shape[1] == seqlen, f"Sequence length mismatch, expected {seqlen}, got {inp.shape[1]}"
-
-            trainloader.append(inp)
-            # After successfully generating a sample, break out of the inner while loop
-            break
-            
-    return trainloader
+            if input_ids.shape[1] >= seqlen:
+                input_ids = input_ids[:, :seqlen]
+                entropies = entropies[:, :seqlen]
+                data.append({'input_ids': input_ids, 'entropies': entropies})
+    return data
 
 
 def get_loaders(
@@ -251,50 +247,43 @@ def get_loaders(
     model_path=None,
     use_fast_tokenizer=False,
     trust_remote_code=None,
+    # --- 新增参数 ---
+    use_entropy=False,
+    entropy_thresholds: Optional[dict] = None, 
+    weight_from_entropy: bool = False,
+    weight_hyperparam_C: float = 2.0,
 ):
-    """
-    Loads and prepares data for a Transformers model.
-    Args:
-        name (str): The name of the dataset to load.
-        This can be one of 'wikitext2', 'c4', 'ptb','pajama', 'openmathreasoning' for datasets loaded from Huggingface datasets,
-        or 'none' for cases where a dataset is not needed, like RTN. It can also accept data path to custom file.
-        nsamples (int, optional): The number of samples to load from the dataset. Defaults to 128.
-        seed (int, optional): The random seed value for data shuffling and splitting. Defaults to 0.
-        seqlen (int, optional): The maximum sequence length for input tokenization. Defaults to 2048.
-        model_path (str, optional): The path to the pretrained model weights or full model name.
-            used to detect llama to call proper tokenizer.
-            see https://github.com/huggingface/transformers/issues/22222#issuecomment-1488578722 for reasons.
-        eval_mode (bool, optional). defines slice selection for 'wikitext2', 'c4', 'ptb' datasets.
-        leave False for train slice.
-        use_fast_tokenizer: whether to use fast tokenizer
-        trust_remote_code: whether to trust remote code
-    Returns:
-        data (torch.utils.data.DataLoader or iterable): Data iterable for the dataset.
-    Note:
-        the popular decapoda-research Llama models have errors in tokenizer config, specifically
-        incorrect token ids for BOS, EOS. This gets corrected to ensure compatibility with transformers
-        of versions 4.29 and above.
-    """
     set_seed(seed)
 
-    # for pre-tokenized datasets
+    if use_entropy:
+        if eval_mode:
+            raise ValueError("Entropy-based quantization is only supported for calibration (non-eval mode).")
+        is_prepared = "openmathreasoning_prepared" in name and os.path.isfile(name)
+        is_live = name.lower() == "openmathreasoning"
+        if not is_prepared and not is_live:
+            raise ValueError("Entropy-based quantization currently only supports 'openmathreasoning' or a prepared file path containing 'openmathreasoning_prepared'.")
 
+    # --- Data Loading ---
     if name.lower() == "none":
-        print("Not loading any dataset. (OK if you use no compression or methods like RTN.)")
+        print("Not loading any dataset.")
         return None
+    
+    data_with_entropy = []
+    if use_entropy:
+        if "openmathreasoning_prepared" in name and os.path.isfile(name):
+            data_with_entropy = get_openmathreasoning_prepared(nsamples, seqlen, name)
+        elif name.lower() == "openmathreasoning":
+            tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=use_fast_tokenizer, trust_remote_code=trust_remote_code)
+            data_with_entropy = get_openmathreasoning(nsamples, seqlen, tokenizer, model_path, trust_remote_code)
+    
     elif os.path.isfile(name):
         try:
             data = torch.load(name)[:nsamples]
+            return data
         except FileNotFoundError:
-            raise FileNotFoundError(
-                f"Failed to load custom data from {name}.",
-                "Check data path or use one of [c4, wikitext2, ptb, pajama, openmathreasoning, none]",
-            )
+            raise FileNotFoundError(f"Failed to load custom data from {name}.")
     else:
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_path, use_fast=use_fast_tokenizer, trust_remote_code=trust_remote_code
-        )
-
+        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=use_fast_tokenizer, trust_remote_code=trust_remote_code)
         if name.lower() == "wikitext2":
             data = get_wikitext2(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
         elif name.lower() == "pajama":
@@ -307,19 +296,41 @@ def get_loaders(
             data = get_c4(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
         elif name.lower() == "c4_new":
             data = get_c4_new(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
-        elif name.lower() == "openmathreasoning":
-            data = get_openmathreasoning(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
         else:
-            raise ValueError(
-                f"Failed to load data from {name}.",
-                "Check dataset name or path or use one of [c4, wikitext2, ptb, pajama, openmathreasoning, none]",
-            )
+            raise ValueError(f"Unknown dataset {name}")
+        return data
 
-    if hasattr(data, "input_ids"):
-        data = data.input_ids
+    # --- Post-processing for entropy-based methods ---
+    if use_entropy:
+        processed_data = []
+        for sample in data_with_entropy:
+            input_ids = sample['input_ids']
+            entropies = sample['entropies']
+            
+            # 1. Generate mask
+            final_mask = torch.ones_like(entropies, dtype=torch.bool)
+            if entropy_thresholds:
+                if 'fixed' in entropy_thresholds:
+                    final_mask &= (entropies > entropy_thresholds['fixed'])
+                if 'percentile' in entropy_thresholds:
+                    quantile_value = torch.quantile(entropies.to(torch.float32), entropy_thresholds['percentile'])
+                    final_mask &= (entropies >= quantile_value)
+            
+            # 2. Generate weight
+            weight = torch.ones_like(entropies, dtype=torch.float32)
+            if weight_from_entropy:
+                min_e = entropies.min()
+                max_e = entropies.max()
+                denom = max_e - min_e + 1e-9
+                normalized_entropies = (entropies - min_e) / denom
+                weight = 1.0 + (weight_hyperparam_C - 1.0) * normalized_entropies
 
-    print(f"Loaded data from {name}; {len(data)=} sequences")
-    return data
+            processed_data.append((input_ids, final_mask, weight))
+        
+        print(f"Loaded and processed {len(processed_data)} samples with entropy data.")
+        return processed_data
+
+    raise RuntimeError("Should not reach here in get_loaders")
 
 
 def split_long_texts(inputs: Sequence[str], split_max_length: int):

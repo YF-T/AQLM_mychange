@@ -11,8 +11,6 @@ from torch.nn.parallel.scatter_gather import Gather
 
 from src.aq import QuantizedWeight
 from src.utils import ellipsis
-# 导入 entropy_masker 单例
-from src.entropy_utils import entropy_masker
 
 
 class AQEngine(nn.Module):
@@ -30,41 +28,57 @@ class AQEngine(nn.Module):
         self.nsamples = 0
 
     @torch.no_grad()
-    def add_batch(self, inp: torch.Tensor):
+    def add_batch(self, inp: torch.Tensor, mask: Optional[torch.Tensor] = None, weight: Optional[torch.Tensor] = None):
         """
         Accumulate a minibatch of layer inputs and update the X.T @ X (aka half hessian).
-        If entropy_masker has a mask, it will be applied automatically.
+        If a mask is provided, it will be used to select tokens.
+        If a weight is provided, it will be used to weight the contribution of each token.
         """
         assert self.XTX is not None, "Already ran quantization; cannot add more data batches"
         if len(inp.shape) == 3:
             inp = inp.reshape((-1, inp.shape[-1]))
         
-        # --- 新增逻辑: 从单例获取并应用 mask ---
-        mask = entropy_masker.get_mask()
+        # --- 新增逻辑: 应用 mask 和 weight ---
         if mask is not None:
-            # 确保 mask 和 input 的序列长度维度匹配
-            # inp shape: [seq_len, hidden_size], mask shape: [1, seq_len]
             mask = mask.squeeze(0) # 变为 [seq_len]
             if mask.shape[0] != inp.shape[0]:
-                 # 在批处理时，输入可能是多个序列拼接而成，需要调整 mask
                  if inp.shape[0] % mask.shape[0] == 0:
                      num_repeats = inp.shape[0] // mask.shape[0]
                      mask = mask.repeat(num_repeats)
                  else:
                      raise ValueError(f"Mask shape {mask.shape} is not compatible with input shape {inp.shape}")
 
-            inp = inp[mask] # 只保留高熵 token 对应的行
+            inp = inp[mask]
+            if weight is not None:
+                weight = weight.squeeze(0) # 变为 [seq_len]
+                if weight.shape[0] != mask.shape[0]: # 确保 weight 和 mask 长度一致
+                    if mask.shape[0] % weight.shape[0] == 0:
+                        num_repeats = mask.shape[0] // weight.shape[0]
+                        weight = weight.repeat(num_repeats)
+                    else:
+                        raise ValueError(f"Original weight shape {weight.shape} is not compatible with mask shape {mask.shape}")
+                weight = weight[mask]
+
             if inp.numel() == 0:
-                return # 如果没有高熵 token，则不进行任何操作
-        # --- 结束 ---
+                return # 如果没有被mask选中的token, 则不进行任何操作
 
         tmp = inp.shape[0]
         inp = inp.t()
 
         self.XTX *= self.nsamples / (self.nsamples + tmp)
         self.nsamples += tmp
-        inp = math.sqrt(1 / self.nsamples) * inp.to(self.XTX.dtype)
-        self.XTX += inp.matmul(inp.t())
+        
+        inp_for_xtx = math.sqrt(1 / self.nsamples) * inp.to(self.XTX.dtype)
+        
+        if weight is not None:
+            # weight.sqrt() 因为XTX是X的平方项，所以权重需要开方
+            # unsqueeze(0) 是为了广播到 [hidden_size, num_tokens]
+            weighted_inp = inp_for_xtx * weight.sqrt().unsqueeze(0)
+            self.XTX += weighted_inp.matmul(weighted_inp.t())
+        else:
+            self.XTX += inp_for_xtx.matmul(inp_for_xtx.t())
+        # --- 结束 ---
+
 
     @torch.enable_grad()
     def quantize(self, *, args: Namespace, verbose: bool = True) -> QuantizedWeight:

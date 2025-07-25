@@ -3,6 +3,7 @@ import time
 from argparse import Namespace
 from itertools import chain
 from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
+import warnings
 
 import torch
 import torch.nn as nn
@@ -13,7 +14,6 @@ from transformers import PreTrainedModel
 from aq_engine import AQEngine
 from src.aq import QuantizedLinear
 from src.datautils import get_loaders
-from src.entropy_utils import entropy_masker # 导入 entropy_masker 单例
 from src.finetune import finetune_groupwise
 from src.modelutils import (
     FALCON_TYPES,
@@ -39,6 +39,13 @@ def quantize_model(model: PreTrainedModel, args: Namespace):
     """main entry point to functions for model quantization"""
     tick = time.time()
     print("Loading data ...")
+    
+    entropy_thresholds = {}
+    if args.entropy_percentile_threshold is not None:
+        entropy_thresholds['percentile'] = args.entropy_percentile_threshold
+    if args.entropy_fixed_threshold is not None:
+        entropy_thresholds['fixed'] = args.entropy_fixed_threshold
+
     data = get_loaders(
         args.dataset,
         nsamples=args.nsamples,
@@ -47,18 +54,43 @@ def quantize_model(model: PreTrainedModel, args: Namespace):
         seqlen=args.model_seqlen,
         use_fast_tokenizer=args.use_fast_tokenizer,
         trust_remote_code=args.trust_remote_code,
+        use_entropy=args.use_entropy,
+        entropy_thresholds=entropy_thresholds,
+        weight_from_entropy=args.weight_from_entropy,
+        weight_hyperparam_C=args.weight_hyperparam_C,
     )
-    if args.val_size > 0:
-        all_ids = torch.randperm(len(data))
-        train_ids, val_ids = all_ids[args.val_size :], all_ids[: args.val_size]
-        train_data = [data[i] for i in train_ids]
-        val_data = [data[i] for i in val_ids]
-    else:
-        train_data = data
-        val_data = None
 
-    # 将原始的 token_ids 数据也传入 quantize_aq
-    results = quantize_aq(model, train_data, val_data, args, original_tokens=data)
+    if args.use_entropy:
+        # Data is a list of tuples (input_ids, mask, weight)
+        input_ids_list = [item[0] for item in data]
+        masks_list = [item[1] for item in data]
+        weights_list = [item[2] for item in data]
+    else:
+        # Data is a list of tensors (input_ids)
+        input_ids_list = data
+        masks_list = None
+        weights_list = None
+
+    if args.val_size > 0:
+        all_indices = torch.randperm(len(input_ids_list))
+        train_indices, val_indices = all_indices[args.val_size :], all_indices[: args.val_size]
+        
+        train_data = [input_ids_list[i] for i in train_indices]
+        val_data = [input_ids_list[i] for i in val_indices]
+        
+        train_masks = [masks_list[i] for i in train_indices] if masks_list else None
+        val_masks = [masks_list[i] for i in val_indices] if masks_list else None
+        
+        train_weights = [weights_list[i] for i in train_indices] if weights_list else None
+        val_weights = [weights_list[i] for i in val_indices] if weights_list else None
+
+    else:
+        train_data = input_ids_list
+        val_data = None
+        train_masks, val_masks = masks_list, None
+        train_weights, val_weights = weights_list, None
+
+    results = quantize_aq(model, train_data, val_data, args, train_masks, val_masks, train_weights, val_weights)
     print(f"quantization time: {time.time() - tick:.1f}")
     return results
 
@@ -80,8 +112,9 @@ def get_inps(
     layers = get_layers(model)
     device = devices[0] if not offload_activations else torch.device("cpu")
 
-    if isinstance(data, torch.Tensor) and data.shape[0] == 1:  # given a single long tensor, split it into sequences
-        assert data.ndim == 2, "data must be either a single tensor with a long sequence or a list of pre-cut sequences"
+    if isinstance(data[0], torch.Tensor) and data[0].ndim == 2:
+        pass # Data is already a list of tensors
+    elif isinstance(data, torch.Tensor) and data.ndim == 2: # given a single long tensor, split it into sequences
         num_sequences, num_tokens_dropped = data.numel() // model_seqlen, data.numel() % model_seqlen
         data = [data[:, i * model_seqlen : (i + 1) * model_seqlen].to(device) for i in range(num_sequences)]
         print(f"Got {len(data)} sequences of {model_seqlen} tokens, dropped last {num_tokens_dropped} tokens")
@@ -164,7 +197,16 @@ def get_inps(
 
 
 @torch.no_grad()
-def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Sequence], args: Namespace, original_tokens: Sequence):
+def quantize_aq(
+    model: PreTrainedModel, 
+    data: Sequence, 
+    val_data: Optional[Sequence], 
+    args: Namespace,
+    masks: Optional[Sequence[torch.Tensor]] = None,
+    val_masks: Optional[Sequence[torch.Tensor]] = None,
+    weights: Optional[Sequence[torch.Tensor]] = None,
+    val_weights: Optional[Sequence[torch.Tensor]] = None,
+):
     assert not torch.backends.cuda.matmul.allow_tf32
     print("\nStarting AQ quantization ...")
     inps, forward_args = get_inps(model, data, args.model_seqlen, args.devices, args.offload_activations)
@@ -194,7 +236,7 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
 
         layer_device_original = next(layers[layer_index].parameters()).device
         layer_dtype_original = next(layers[layer_index].parameters()).dtype
-        print(f"{layer_device_original=}")
+        print(f"layer_device_original={layer_device_original}")
         layer = layers[layer_index].to(args.devices[0])
         for k, v in forward_args.items():
             forward_args[k] = v.to(args.devices[0]) if isinstance(v, torch.Tensor) else v
@@ -238,8 +280,8 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                     ],
                     inps[0],
                     outs[0],
-                    use_entropy_masking=args.use_entropy_masking,
-                    original_tokens=original_tokens,
+                    masks=masks,
+                    weights=weights,
                     **forward_args,
                 )
             else:
@@ -253,8 +295,8 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                     ],
                     inps,
                     outs,
-                    use_entropy_masking=args.use_entropy_masking,
-                    original_tokens=original_tokens,
+                    masks=masks,
+                    weights=weights,
                     **forward_args,
                 )
 
@@ -368,7 +410,7 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
         if number_of_quantized_params > 0:
             wandb.log({"Avg_bits": overall_bits / number_of_quantized_params})
     model.config.use_cache = use_cache
-    print(f"quantize: {torch.cuda.max_memory_allocated()=:,}")
+    print(f"quantize: max_memory_allocated={torch.cuda.max_memory_allocated():,}")
     return quantizers
 
 
@@ -433,8 +475,8 @@ def init_aq_engines(
     names: Sequence[str],
     inps_tensor: torch.Tensor,
     outs_tensor: torch.Tensor,
-    use_entropy_masking: bool,
-    original_tokens: Optional[Sequence[torch.Tensor]],
+    masks: Optional[Sequence[torch.Tensor]] = None,
+    weights: Optional[Sequence[torch.Tensor]] = None,
     **forward_args: Dict[str, Any],
 ) -> Dict[str, AQEngine]:
     """
@@ -457,13 +499,14 @@ def init_aq_engines(
                 setattr(module, child_name, _LayerWrapperThatAccumulatesXTX(child, wrapped_layer_to_hander[child]))
 
     for j in trange(len(inps_tensor), desc="calc outs before quantization", leave=False):
-        if use_entropy_masking:
-            entropy_masker.generate_and_set_mask(original_tokens[j])
-        else:
-            entropy_masker.current_mask = None # 确保在不使用时清空 mask
+        forward_args_for_sample = forward_args.copy()
+        if masks:
+            forward_args_for_sample['mask'] = masks[j]
+        if weights:
+            forward_args_for_sample['weight'] = weights[j]
 
         outs_tensor[j].copy_(
-            layer(inps_tensor[j].to(device).unsqueeze(0), **forward_args)[0].view_as(outs_tensor[j]), non_blocking=True
+            layer(inps_tensor[j].to(device).unsqueeze(0), **forward_args_for_sample)[0].view_as(outs_tensor[j]), non_blocking=True
         )
 
     for module in list(layer.modules()):
@@ -479,8 +522,9 @@ class _LayerWrapperThatAccumulatesXTX(nn.Module):
         self.wrapped_layer, self.aq_handler = layer, aq_handler
 
     def forward(self, input, *args, **kwargs):
-        # The actual masking happens inside add_batch
-        self.aq_handler.add_batch(input)
+        mask = kwargs.pop('mask', None)
+        weight = kwargs.pop('weight', None)
+        self.aq_handler.add_batch(input, mask=mask, weight=weight)
         return self.wrapped_layer(input, *args, **kwargs)
 
 
@@ -491,29 +535,23 @@ def init_aq_engines_parallel(
     names: Sequence[str],
     inps: Sequence[torch.Tensor],
     outs: Sequence[torch.Tensor],
-    use_entropy_masking: bool,
-    original_tokens: Optional[Sequence[torch.Tensor]],
+    masks: Optional[Sequence[torch.Tensor]] = None,
+    weights: Optional[Sequence[torch.Tensor]] = None,
     **forward_args,
 ):
-    if use_entropy_masking:
-        raise NotImplementedError("Parallel entropy masking is not implemented.")
+    if masks is not None or weights is not None:
+        # This is a simplification. A full implementation would require splitting
+        # the masks and weights lists across devices, similar to how `inps` is handled.
+        raise NotImplementedError("Parallel entropy masking/weighting is not implemented.")
     
     """Parallel version of init_aq_engines; works on lists of input/output tensors"""
-    # Split original_tokens across devices, mirroring how `inps` is split
-    nsamples_per_device = (len(original_tokens) - 1) // len(devices) + 1
-    original_tokens_by_device = [
-        original_tokens[i * nsamples_per_device : min((i + 1) * nsamples_per_device, len(original_tokens))]
-        for i in range(len(devices))
-    ]
-
     layer_replicas = torch.nn.parallel.replicate(layer, devices=devices, detach=True)
     layer_replicas[0] = layer
     funcs_by_device = [init_aq_engines for _ in devices]
     inputs_by_device = []
     kwargs_by_device = []
     for i in range(len(devices)):
-        # Pass the per-device chunk of original_tokens
-        inputs_by_device.append((layer_replicas[i], names, inps[i], outs[i], use_entropy_masking, original_tokens_by_device[i]))
+        inputs_by_device.append((layer_replicas[i], names, inps[i], outs[i], None, None)) # Pass None for masks/weights
         kwargs_by_device.append(
             {
                 k: (v.to(devices[i], non_blocking=True) if isinstance(v, torch.Tensor) else v)
@@ -846,21 +884,32 @@ def main():
     )
     # 新增的命令行参数
     parser.add_argument(
-        "--use_entropy_masking",
+        "--use_entropy",
         action="store_true",
-        help="Enable entropy-based masking for XTX calculation."
+        help="Enable entropy-based masking and weighting for XTX calculation."
     )
     parser.add_argument(
         "--entropy_fixed_threshold",
         type=float,
         default=None,
-        help="Fixed entropy threshold for masking. Used if --use_entropy_masking is set."
+        help="Fixed entropy threshold for masking. Used if --use_entropy is set."
     )
     parser.add_argument(
         "--entropy_percentile_threshold",
         type=float,
         default=None,
-        help="Percentile entropy threshold for masking. Used if --use_entropy_masking is set."
+        help="Percentile entropy threshold for masking. Used if --use_entropy is set."
+    )
+    parser.add_argument(
+        "--weight_from_entropy",
+        action="store_true",
+        help="Enable token weighting based on entropy. Used if --use_entropy is set."
+    )
+    parser.add_argument(
+        "--weight_hyperparam_C",
+        type=float,
+        default=2.0,
+        help="Maximum weight for the highest entropy token. Used if --weight_from_entropy is set."
     )
 
 
@@ -880,11 +929,9 @@ def main():
         args.devices = [torch.device(device_str) for device_str in args.devices]
     assert all(isinstance(device, torch.device) for device in args.devices)
 
-    # MODIFICATION: Enforce single GPU for entropy masking
-    if args.use_entropy_masking and len(args.devices) > 1:
-        raise ValueError(
-            "Entropy masking feature is currently only supported for single-GPU execution. "
-            "Please specify a single device, e.g., --devices cuda:0"
+    if args.use_entropy and len(args.devices) > 1:
+        warnings.warn(
+            "Entropy-based quantization with multiple GPUs is experimental and may not be fully optimized."
         )
 
     if args.nsamples is not None:
@@ -920,16 +967,6 @@ def main():
         trust_remote_code=args.trust_remote_code,
     ).train(False)
 
-    # 配置 entropy_masker
-    if args.use_entropy_masking:
-        print("\n============ Configuring Entropy Masker... ============")
-        entropy_masker.configure(
-            model_name=args.model_path,
-            device=args.devices[0], # 强制使用主设备
-            fixed_threshold=args.entropy_fixed_threshold,
-            percentile_threshold=args.entropy_percentile_threshold
-        )
-
     if not args.load and not args.no_quant:
         print("\n============ Quantizing model... ============")
         quantize_model(model, args)
@@ -952,7 +989,7 @@ def main():
         args.dataset_name = dataset
         perplexity_eval(model, testloader, args)
 
-    print(f"eval: {torch.cuda.max_memory_allocated()=:,}")
+    print(f"eval: max_memory_allocated={torch.cuda.max_memory_allocated():,}")
     if args.wandb:
         wandb.log({"max_cuda_mem_eval": round(torch.cuda.max_memory_allocated() / 1e9, 2)})
 

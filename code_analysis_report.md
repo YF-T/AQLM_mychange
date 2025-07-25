@@ -20,6 +20,7 @@
 ├── aq_engine.py
 ├── convert_legacy_model_format.py
 ├── convert_to_hf.py
+├── cot_quant_method.md
 ├── finetune.py
 ├── lmeval.py
 ├── main.py
@@ -62,6 +63,7 @@
 │   │   ├── beam_search_xtx.py
 │   │   ├── configurable_adam.py
 │   │   ├── datautils.py
+│   │   ├── entropy_utils.py
 │   │   ├── finetune.py
 │   │   ├── kmeans.py
 │   │   ├── memory_efficient_loss.py
@@ -495,6 +497,8 @@ from torch.nn.parallel.scatter_gather import Gather
 
 from src.aq import QuantizedWeight
 from src.utils import ellipsis
+# 导入 entropy_masker 单例
+from src.entropy_utils import entropy_masker
 
 
 class AQEngine(nn.Module):
@@ -513,10 +517,33 @@ class AQEngine(nn.Module):
 
     @torch.no_grad()
     def add_batch(self, inp: torch.Tensor):
-        """Accumulate a minibatch of layer inputs and update the X.T @ X (aka half hessian)"""
+        """
+        Accumulate a minibatch of layer inputs and update the X.T @ X (aka half hessian).
+        If entropy_masker has a mask, it will be applied automatically.
+        """
         assert self.XTX is not None, "Already ran quantization; cannot add more data batches"
         if len(inp.shape) == 3:
             inp = inp.reshape((-1, inp.shape[-1]))
+        
+        # --- 新增逻辑: 从单例获取并应用 mask ---
+        mask = entropy_masker.get_mask()
+        if mask is not None:
+            # 确保 mask 和 input 的序列长度维度匹配
+            # inp shape: [seq_len, hidden_size], mask shape: [1, seq_len]
+            mask = mask.squeeze(0) # 变为 [seq_len]
+            if mask.shape[0] != inp.shape[0]:
+                 # 在批处理时，输入可能是多个序列拼接而成，需要调整 mask
+                 if inp.shape[0] % mask.shape[0] == 0:
+                     num_repeats = inp.shape[0] // mask.shape[0]
+                     mask = mask.repeat(num_repeats)
+                 else:
+                     raise ValueError(f"Mask shape {mask.shape} is not compatible with input shape {inp.shape}")
+
+            inp = inp[mask] # 只保留高熵 token 对应的行
+            if inp.numel() == 0:
+                return # 如果没有高熵 token，则不进行任何操作
+        # --- 结束 ---
+
         tmp = inp.shape[0]
         inp = inp.t()
 
@@ -1101,6 +1128,86 @@ if __name__ == "__main__":
     if args.save_tokenizer:
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         tokenizer.save_pretrained(args.out_path)
+```
+
+### `cot_quant_method.md`
+
+```markdown
+# 基于熵的选择性量化方法：原理与实现策略
+
+## 摘要
+
+本文针对大规模语言模型（LLM）在后训练量化（PTQ）后面临的性能瓶颈，提出了一种新颖的“基于熵的选择性量化”方法。传统PTQ方法在校准时平等对待所有token，忽略了不同token对模型在复杂任务（如代码生成、数学推理）中重要性的差异。为解决此问题，我们的方法通过计算模型预测的香农熵，来识别信息量最丰富、模型最“不确定”的关键token。我们仅利用这些高熵token对应的激活来构建量化所需的二阶统计矩阵（`XTX`），从而将量化精度资源集中于对模型性能影响最大的部分。本文将详细阐述该方法的原理、实现策略及预期优势，旨在为面向特定任务的高精度LLM压缩提供新的解决思路。
+
+---
+
+### 1. 引言与动机
+
+现有的 PTQ 方法，如 AQLM，通过在少量校准数据上最小化量化前后每一层输出的误差来实现权重压缩。这个过程的核心是计算一个二阶统计矩阵 `XTX`，它捕获了校准数据输入激活的分布特性。然而，标准的校准流程存在一个潜在的优化空间：它平等地对待校准集中的每一个 token。
+
+对于代码、科学文献或数学推理等专业领域的长序列文本，信息并非均匀分布。某些 token（例如，一个关键的函数名、一个逻辑运算符或一个非平凡的数学符号）往往比其他常见 token（如括号、通用变量名或自然语言中的停用词）包含更多的信息，也更难预测。当模型在这些关键位置犯错时，其性能会受到严重影响。
+
+**我们的核心假设是**：模型在处理这些关键、信息丰富的 token 时表现出的“不确定性”，可以通过其输出 logits 的熵来量化。一个高熵的预测分布意味着模型对于下一个 token 有多种可能性，表明当前 token 是一个“意外”或“关键”的转折点。我们推断，模型在这些高熵位置的预测误差对整体性能的影响更为显著，因此，在量化过程中优先保证这些关键位置的激活精度至关重要。
+
+基于此，我们提出了一种**基于熵的选择性量化 (Entropy-based Selective Quantization)** 方法。其目标是：**在量化校准阶段，识别并仅关注这些高熵 token，以它们对应的激活来指导量化参数的学习，从而在保持甚至提升模型在复杂任务上性能的同时，完成高效的权重压缩。**
+
+### 2. 方法原理
+
+#### 2.1 AQLM 量化与 `XTX` 矩阵的核心作用
+
+AQLM 方法的目标是为每一层的权重矩阵 $W$ 找到一个量化后的近似 $\hat{W}$，使得在给定校准输入激活 $X$ 的情况下，层输出的均方误差 $||\hat{W}X - WX||^2_F$ 最小化。这个优化问题的解，尤其是码本（codebooks）和码字（codes）的搜索过程，严重依赖于输入激活的二阶统计矩阵，即 $XX^T$（在代码中记为 `XTX`）。
+
+可以将 `XTX` 矩阵理解为输入数据激活的‘指纹’，它描绘了数据中最重要的特征方向和关联性。具体来说，它告诉优化器：
+* 哪些输入特征维度是重要的（对角线上的值较大）。
+* 哪些输入特征维度是高度相关的（非对角线上的值较大）。
+
+因此，`XTX` 的质量直接决定了量化方案的优劣。一个能够准确反映任务核心数据分布的 `XTX` 矩阵，将引导优化器生成一个在关键特征上误差更小的量化权重 $\hat{W}$。
+
+#### 2.2 核心创新：基于熵 Mask 的 `XTX` 构建
+
+我们的创新点在于改变 `XTX` 的构建方式，使其不再反映**所有** token 的统计特性，而是**只反映高信息量 token** 的统计特性。
+
+1.  **熵作为信息量的代理指标**:
+    对于模型在某个位置的预测输出 `logits`，我们可以计算其对应的概率分布 $p = \text{softmax}(\text{logits})$。该分布的香农熵定义为：
+    $$H(p) = -\sum_{i=1}^{V} p_i \log_2 p_i$$
+    其中 $V$ 是词汇表的大小。一个较高的熵值 $H(p)$ 意味着概率分布更平坦，模型对下一个 token 的预测更不确定，这表明当前上下文是一个信息量丰富或模型不熟悉的关键节点。
+
+2.  **Mask 生成**:
+    我们为校准集中的每一个序列 `S` 都进行一次预处理。使用原始的、未量化的模型对 `S` 进行一次完整的前向传播，得到每个位置的 `logits`。然后，我们计算出每个位置的熵，并根据预设的阈值（例如，保留熵最高的20%的 token）生成一个布尔类型的 `mask` 张量 `M`。`M[i]` 为 `True` 表示位置 `i` 是一个高熵 token。
+
+3.  **选择性 `XTX` 累加**:
+    在构建 `XTX` 矩阵时，对于每一层的输入激活 $X_{layer}$（形状为 `[seq_len, hidden_size]`），我们使用 `mask` `M` 来进行筛选。原始的 `XTX` 计算可以看作是 $\sum X_{layer}^T X_{layer}$，而我们的新方法则是：
+    $$XTX_{masked} = \sum (X_{layer}[M])^T (X_{layer}[M])$$
+    这意味着，只有那些 `mask` 为 `True` 的 token 所对应的激活行向量，才会被用来累加到 `XTX` 矩阵中。
+
+通过这种方式，我们构建出的 `XTX` 矩阵将主要反映模型在处理关键、困难的 token 时的激活统计特性，从而引导量化过程着重优化在这些点上的表现。
+
+### 3. 实现策略
+
+为了实现上述原理，同时最小化对 AQLM 现有代码的侵入性，我们采用以下策略：
+
+1.  **数据预处理与加载**:
+    * 我们假设用户会离线完成一个数据预处理步骤：使用 `entropy_utils.py` 中的 `EntropyMasker` 类，为 `openmathreasoning` 数据集的每个样本生成并保存其对应的 `mask`。
+    * 最终的校准数据集将是一个包含 `input_ids` 和 `mask` 两个字段的结构化数据。
+    * 在 `src/datautils.py` 中，我们实现一个新的数据加载函数 `get_openmathreasoning_with_mask`，专门用于加载这种带 mask 的数据集。`get_loaders` 函数会根据新的数据集名称（如 `openmath_masked`）来调用它。
+
+2.  **非侵入式 Mask 传递**:
+    * 我们**不改变模型各层之间的数据流**。这一‘非侵入式’策略至关重要，因为它保证了校准过程中每一层接收到的激活序列的完整性。直接对激活张量进行屏蔽（例如，删除某些 token 对应的行）会破坏序列的长度和位置信息，从而导致依赖于序列顺序的操作（如注意力机制）计算出完全错误的结果。
+    * `mask` 的传递通过 `forward_args` 字典实现。在 `main.py` 的 `init_aq_engines` 函数中，当处理每个样本时，我们会将该样本对应的 `mask` 添加到 `forward_args` 中。
+
+3.  **精准修改 `AQEngine`**:
+    * 唯一的、最核心的修改点位于 `src/aq_engine.py` 中的 `AQEngine.add_batch` 方法。
+    * 我们为 `add_batch` 增加一个可选的 `mask` 参数。
+    * 在 `add_batch` 内部，我们检查 `mask` 是否存在。如果存在，就在累加 `XTX` 之前，用它来筛选输入的激活 `inp`。如果 `mask` 为 `None`（即在不使用熵 masking 的情况下），该函数的行为与原始代码完全相同。
+
+这种实现方式将改动精准地限制在了数据加载和 `XTX` 累加两个环节，逻辑清晰，且与项目原有的并行计算模式兼容。
+
+### 4. 预期优势与展望
+
+* **面向复杂任务的性能优化**: 通过在量化校准时“聚焦”于高难度 token，我们期望模型在量化后能更好地保留其在复杂推理、逻辑推断等任务上的性能。
+* **更优的资源分配**: 这种方法可以被看作是一种对“量化校准资源”的智能分配，将计算重点放在了最影响模型性能的地方。
+* **任务对齐**: 使用 `openmathreasoning` 等特定领域的数据进行校准，本身就比使用通用语料（如 C4）更能让量化模型适应目标任务。我们的方法通过熵筛选，进一步强化了这种任务对齐。
+* **未来工作**: 可以进一步探索不同的 mask 生成策略，例如动态阈值、多轮次迭代 masking，或者将熵与其他指标（如梯度大小）结合，以更精确地识别关键 token。
 ```
 
 ### `finetune.py`
@@ -2603,6 +2710,7 @@ from transformers import PreTrainedModel
 from aq_engine import AQEngine
 from src.aq import QuantizedLinear
 from src.datautils import get_loaders
+from src.entropy_utils import entropy_masker # 导入 entropy_masker 单例
 from src.finetune import finetune_groupwise
 from src.modelutils import (
     FALCON_TYPES,
@@ -2646,7 +2754,8 @@ def quantize_model(model: PreTrainedModel, args: Namespace):
         train_data = data
         val_data = None
 
-    results = quantize_aq(model, train_data, val_data, args)
+    # 将原始的 token_ids 数据也传入 quantize_aq
+    results = quantize_aq(model, train_data, val_data, args, original_tokens=data)
     print(f"quantization time: {time.time() - tick:.1f}")
     return results
 
@@ -2752,7 +2861,7 @@ def get_inps(
 
 
 @torch.no_grad()
-def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Sequence], args: Namespace):
+def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Sequence], args: Namespace, original_tokens: Sequence):
     assert not torch.backends.cuda.matmul.allow_tf32
     print("\nStarting AQ quantization ...")
     inps, forward_args = get_inps(model, data, args.model_seqlen, args.devices, args.offload_activations)
@@ -2780,9 +2889,7 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
         stats_payload = {}
         start_time = time.time()
 
-        # quantized layer will return there
         layer_device_original = next(layers[layer_index].parameters()).device
-        # backup layer dtype
         layer_dtype_original = next(layers[layer_index].parameters()).dtype
         print(f"{layer_device_original=}")
         layer = layers[layer_index].to(args.devices[0])
@@ -2803,8 +2910,7 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                 layer = torch.load(layer_save_path, map_location=args.devices[0])
                 loaded_layer = True
 
-        # prepare validation  outputs
-        if run_validation and not loaded_layer:  # note: if we skip validation, val_outs will still be updated later
+        if run_validation and not loaded_layer:
             if len(args.devices) == 1:
                 assert len(val_inps) == len(val_outs) == 1
                 update_outs(layer, val_inps[0], val_outs[0], compute_mse=not args.skip_out_loss, **forward_args)
@@ -2817,8 +2923,9 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
             if loaded_layer:
                 print("Skipping quantization: loaded a previously quantized layer")
                 break
+            
             if len(args.devices) == 1:
-                assert len(inps) == len(outs) == 1  # number of per-device inputs/outputs
+                assert len(inps) == len(outs) == 1
                 aq_handlers = init_aq_engines(
                     layer,
                     [
@@ -2828,6 +2935,8 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                     ],
                     inps[0],
                     outs[0],
+                    use_entropy_masking=args.use_entropy_masking,
+                    original_tokens=original_tokens,
                     **forward_args,
                 )
             else:
@@ -2841,8 +2950,11 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                     ],
                     inps,
                     outs,
+                    use_entropy_masking=args.use_entropy_masking,
+                    original_tokens=original_tokens,
                     **forward_args,
                 )
+
             for sublayer_name in aq_handlers.keys():
                 print(f"Quantizing module {sublayer_name} of layer {layer_index}")
                 if "mixtral" in model.config.model_type.lower() and args.mix_compression:
@@ -2857,7 +2969,7 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                 with torch.no_grad():
                     assert aq_handlers[sublayer_name].layer.weight in set(
                         layer.parameters()
-                    )  # test that this is not a replica
+                    )
 
                     new_linear = QuantizedLinear(quantized_weight, aq_handlers[sublayer_name].layer.bias)
                     if args.use_checkpointing:
@@ -2868,15 +2980,14 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                         for child_name, child_module in submodule.named_children():
                             if child_module is aq_handlers[sublayer_name].layer:
                                 setattr(submodule, child_name, new_linear)
-                                found_original = True  # note: do not break to handle tied layers
-
+                                found_original = True
                     assert found_original, f"could not find {sublayer_name}"
 
                 weight_avg_bits = quantized_weight.estimate_nbits_per_parameter()
                 overall_bits += int(weight_avg_bits * torch.numel(aq_handlers[sublayer_name].layer.weight.data))
                 number_of_quantized_params += torch.numel(aq_handlers[sublayer_name].layer.weight.data)
                 print("curent_avg_bits", overall_bits / number_of_quantized_params)
-                quantizers["model.layers.%d.%s" % (layer_index, sublayer_name)] = ()  # to be updated
+                quantizers["model.layers.%d.%s" % (layer_index, sublayer_name)] = ()
 
             del aq_handlers
             assert not loaded_layer
@@ -2903,7 +3014,7 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
             print(f"Saving layer {layer_index}... to {layer_save_path}")
             torch.save(layer, layer_save_path)
             if args.on_save:
-                exec(args.on_save)  # a callback e.g. to save progress in slurm or similar distributed infrastructure
+                exec(args.on_save)
 
         should_compute_mse = not (args.skip_out_loss or loaded_layer)
         if len(args.devices) == 1:
@@ -2935,7 +3046,6 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
         if run_validation:
             val_inps, val_outs = val_outs, val_inps
 
-        # Logging
         stats_payload["layer_time"] = time.time() - start_time
         stats_payload["Step"] = layer_index
         if args.wandb:
@@ -2948,11 +3058,11 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
         torch.save(vars(args), os.path.join(args.save, "args.pt"))
         save_not_quantized_weights(model, args.save)
         if args.on_save:
-            exec(args.on_save)  # a callback e.g. to save progress in slurm or similar distributed infrastructure
+            exec(args.on_save)
 
     if args.wandb:
         wandb.log({"max_cuda_mem_quantize": round(torch.cuda.max_memory_allocated() / 1e9, 2)})
-        if number_of_quantized_params > 0:  # do not report avg bits if we load all pre-quantized layers via --resume
+        if number_of_quantized_params > 0:
             wandb.log({"Avg_bits": overall_bits / number_of_quantized_params})
     model.config.use_cache = use_cache
     print(f"quantize: {torch.cuda.max_memory_allocated()=:,}")
@@ -3020,18 +3130,14 @@ def init_aq_engines(
     names: Sequence[str],
     inps_tensor: torch.Tensor,
     outs_tensor: torch.Tensor,
+    use_entropy_masking: bool,
+    original_tokens: Optional[Sequence[torch.Tensor]],
     **forward_args: Dict[str, Any],
 ) -> Dict[str, AQEngine]:
     """
     Create a dictionary of AQUtil instances for each quantized layer;
     Run forward pass on each sample in inps_tensor; write output activations to outs_tensor (in-plance)
     Accumulate XTX to each one of aq_handlers
-    :param layer: transformer layer with one or more linear layer to be quantized
-    :param names: a list/tuple of string names for linear sub-layers inside :layer: that shall be quantized
-    :param inps_tensor: a tensor of input activations, [nsamples_per_device, seq_len, hidden_size]
-    :param outs_tensor: a tensor to write output activations into, [nsamples_per_device, seq_len, hidden_size]
-    :param forward_args: additional keyword arguments, e.g. attention mask
-    :returns: a dictionary where keys are full layer names and values are AQUtil instances ready to run .quantize
     """
     device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
     all_sublayers = find_sublayers(layer)
@@ -3041,21 +3147,22 @@ def init_aq_engines(
     for sublayer_name in subset:
         aq_handlers[sublayer_name] = AQEngine(subset[sublayer_name])
 
-    # wrap all quantized sub-layers with a wrapper that accumulates inputs on forward
-    # note: the code below uses wrappers instead of hooks because hooks cause bugs in multi-gpu code
     wrapped_layer_to_hander = {aq_handler.layer: aq_handler for aq_handler in aq_handlers.values()}
     for module in list(layer.modules()):
         for child_name, child in list(module.named_children()):
             if child in wrapped_layer_to_hander:
                 setattr(module, child_name, _LayerWrapperThatAccumulatesXTX(child, wrapped_layer_to_hander[child]))
 
-    # compute output activations and accumulate XTX
     for j in trange(len(inps_tensor), desc="calc outs before quantization", leave=False):
+        if use_entropy_masking:
+            entropy_masker.generate_and_set_mask(original_tokens[j])
+        else:
+            entropy_masker.current_mask = None # 确保在不使用时清空 mask
+
         outs_tensor[j].copy_(
             layer(inps_tensor[j].to(device).unsqueeze(0), **forward_args)[0].view_as(outs_tensor[j]), non_blocking=True
         )
 
-    # remove wrappers
     for module in list(layer.modules()):
         for child_name, child in list(module.named_children()):
             if isinstance(child, _LayerWrapperThatAccumulatesXTX):
@@ -3069,6 +3176,7 @@ class _LayerWrapperThatAccumulatesXTX(nn.Module):
         self.wrapped_layer, self.aq_handler = layer, aq_handler
 
     def forward(self, input, *args, **kwargs):
+        # The actual masking happens inside add_batch
         self.aq_handler.add_batch(input)
         return self.wrapped_layer(input, *args, **kwargs)
 
@@ -3080,16 +3188,29 @@ def init_aq_engines_parallel(
     names: Sequence[str],
     inps: Sequence[torch.Tensor],
     outs: Sequence[torch.Tensor],
+    use_entropy_masking: bool,
+    original_tokens: Optional[Sequence[torch.Tensor]],
     **forward_args,
 ):
+    if use_entropy_masking:
+        raise NotImplementedError("Parallel entropy masking is not implemented.")
+    
     """Parallel version of init_aq_engines; works on lists of input/output tensors"""
+    # Split original_tokens across devices, mirroring how `inps` is split
+    nsamples_per_device = (len(original_tokens) - 1) // len(devices) + 1
+    original_tokens_by_device = [
+        original_tokens[i * nsamples_per_device : min((i + 1) * nsamples_per_device, len(original_tokens))]
+        for i in range(len(devices))
+    ]
+
     layer_replicas = torch.nn.parallel.replicate(layer, devices=devices, detach=True)
-    layer_replicas[0] = layer  # this ensures that aq_handlers returned by 0-th replica operate on the main layer
+    layer_replicas[0] = layer
     funcs_by_device = [init_aq_engines for _ in devices]
     inputs_by_device = []
     kwargs_by_device = []
     for i in range(len(devices)):
-        inputs_by_device.append((layer_replicas[i], names, inps[i], outs[i]))
+        # Pass the per-device chunk of original_tokens
+        inputs_by_device.append((layer_replicas[i], names, inps[i], outs[i], use_entropy_masking, original_tokens_by_device[i]))
         kwargs_by_device.append(
             {
                 k: (v.to(devices[i], non_blocking=True) if isinstance(v, torch.Tensor) else v)
@@ -3104,10 +3225,11 @@ def init_aq_engines_parallel(
         replica_handlers = [device_aq_handlers[key] for device_aq_handlers in aq_handles_by_device]
         replica_nsamples = [replica_handler.nsamples for replica_handler in replica_handlers]
         total_nsamples = sum(replica_nsamples)
-        aq_handler.XTX = sum(
-            (replica_handlers[i].XTX * (replica_nsamples[i] / total_nsamples)).to(devices[0], non_blocking=True)
-            for i in range(len(devices))
-        )
+        if total_nsamples > 0:
+            aq_handler.XTX = sum(
+                (replica_handlers[i].XTX * (replica_nsamples[i] / total_nsamples)).to(devices[0], non_blocking=True)
+                for i in range(len(devices))
+            )
         aq_handler.nsamples = total_nsamples
     return aq_handlers
 
@@ -3118,13 +3240,6 @@ def update_outs(
 ) -> Sequence[float]:
     """
     Update outs_tensor with new activations and optionally compute sample-wise mse loss with previous activations
-    :param layer: transformer layer with one or more linear layer to be quantized
-    :param inps_tensor: a tensor of input activations, [nsamples_per_device, seq_len, hidden_size]
-    :param outs_tensor: a tensor to write output activations into, [nsamples_per_device, seq_len, hidden_size]
-    :note: outs_tensor must contain previous activations with which to compute MSE loss
-    :param compute_mse: if True, return a list of sample-wise mse losses; if False, return an empty sequence
-    :param forward_args: additional keyword arguments, e.g. attention mask
-    :returns: a list of mean squared errors for each sequence
     """
     device = torch.device(f"cuda:{torch.cuda.current_device()}" if torch.cuda.is_available() else "cpu")
     out_losses = []
@@ -3183,7 +3298,7 @@ def main():
     parser.add_argument(
         "dataset",
         type=str,
-        help="Dataset name [c4, pajama] or path to data where to extract calibration data from.",
+        help="Dataset name [c4, pajama, openmathreasoning] or path to data where to extract calibration data from.",
     )
     parser.add_argument(
         "--new_eval",
@@ -3426,6 +3541,25 @@ def main():
         action="store_true",
         help="Whether to trust remote code.",
     )
+    # 新增的命令行参数
+    parser.add_argument(
+        "--use_entropy_masking",
+        action="store_true",
+        help="Enable entropy-based masking for XTX calculation."
+    )
+    parser.add_argument(
+        "--entropy_fixed_threshold",
+        type=float,
+        default=None,
+        help="Fixed entropy threshold for masking. Used if --use_entropy_masking is set."
+    )
+    parser.add_argument(
+        "--entropy_percentile_threshold",
+        type=float,
+        default=None,
+        help="Percentile entropy threshold for masking. Used if --use_entropy_masking is set."
+    )
+
 
     torch.set_num_threads(min(16, torch.get_num_threads()))
     torch.backends.cudnn.allow_tf32 = False
@@ -3443,7 +3577,13 @@ def main():
         args.devices = [torch.device(device_str) for device_str in args.devices]
     assert all(isinstance(device, torch.device) for device in args.devices)
 
-    # validate val size
+    # MODIFICATION: Enforce single GPU for entropy masking
+    if args.use_entropy_masking and len(args.devices) > 1:
+        raise ValueError(
+            "Entropy masking feature is currently only supported for single-GPU execution. "
+            "Please specify a single device, e.g., --devices cuda:0"
+        )
+
     if args.nsamples is not None:
         assert args.val_size < args.nsamples, "Number of validation set must be smaller than train + val"
 
@@ -3476,6 +3616,16 @@ def main():
         attn_implementation=args.attn_implementation,
         trust_remote_code=args.trust_remote_code,
     ).train(False)
+
+    # 配置 entropy_masker
+    if args.use_entropy_masking:
+        print("\n============ Configuring Entropy Masker... ============")
+        entropy_masker.configure(
+            model_name=args.model_path,
+            device=args.devices[0], # 强制使用主设备
+            fixed_threshold=args.entropy_fixed_threshold,
+            percentile_threshold=args.entropy_percentile_threshold
+        )
 
     if not args.load and not args.no_quant:
         print("\n============ Quantizing model... ============")
@@ -7127,6 +7277,74 @@ def get_c4_new(nsamples, seqlen, tokenizer, eval_mode=False):
         return valenc
 
 
+def get_openmathreasoning(nsamples, seqlen, tokenizer, eval_mode=False):
+    """
+    Loads and processes the nvidia/OpenMathReasoning dataset for calibration.
+    
+    Args:
+        nsamples (int): The number of calibration samples to generate.
+        seqlen (int): The target sequence length for each sample.
+        tokenizer: The Hugging Face tokenizer to use for encoding text.
+        eval_mode (bool): Not used here, for interface consistency only.
+
+    Returns:
+        list: A list of PyTorch tensors, each with the shape [1, seqlen].
+    """
+    if eval_mode:
+        raise NotImplementedError("get_openmathreasoning function does not support evaluation mode.")
+
+    print("Loading dataset from nvidia/OpenMathReasoning...")
+    # Load only the training split for calibration
+    dataset = load_dataset("nvidia/OpenMathReasoning", split="train")
+
+    trainloader = []
+    # Use trange for a progress bar, consistent with other functions in the project
+    for _ in trange(nsamples, desc="Building OpenMathReasoning calibration set", leave=False):
+        while True:
+            # Select a random data point
+            i = random.randint(0, len(dataset) - 1)
+            sample = dataset[i]
+            
+            question = sample.get('question')
+            solution_dict = sample.get('solution')
+
+            # Ensure both question and answer are valid
+            if not question or not solution_dict or not solution_dict.get('generated_solution'):
+                continue
+            
+            answer = solution_dict['generated_solution']
+
+            # Step 1: Use the tokenizer's chat template to format and concatenate the question and answer, then tokenize
+            messages = [
+                {"role": "user", "content": question},
+                {"role": "assistant", "content": answer},
+            ]
+            
+            tokenized_chat = tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=False, # We don't need a generation prompt at the end
+                return_tensors="pt"
+            )
+
+            # Step 2: Check length and construct the dataset
+            # If the total length is less than seqlen, skip this data point
+            if tokenized_chat.shape[1] < seqlen:
+                continue
+
+            # If the length is sufficient, truncate to [1, seqlen]
+            inp = tokenized_chat[:, :seqlen]
+            
+            # Assert to ensure the shape is correct
+            assert inp.shape[1] == seqlen, f"Sequence length mismatch, expected {seqlen}, got {inp.shape[1]}"
+
+            trainloader.append(inp)
+            # After successfully generating a sample, break out of the inner while loop
+            break
+            
+    return trainloader
+
+
 def get_loaders(
     name,
     nsamples=128,
@@ -7141,7 +7359,7 @@ def get_loaders(
     Loads and prepares data for a Transformers model.
     Args:
         name (str): The name of the dataset to load.
-        This can be one of 'wikitext2', 'c4', 'ptb','pajama' for datasets loaded from Huggingface datasets,
+        This can be one of 'wikitext2', 'c4', 'ptb','pajama', 'openmathreasoning' for datasets loaded from Huggingface datasets,
         or 'none' for cases where a dataset is not needed, like RTN. It can also accept data path to custom file.
         nsamples (int, optional): The number of samples to load from the dataset. Defaults to 128.
         seed (int, optional): The random seed value for data shuffling and splitting. Defaults to 0.
@@ -7173,7 +7391,7 @@ def get_loaders(
         except FileNotFoundError:
             raise FileNotFoundError(
                 f"Failed to load custom data from {name}.",
-                "Check data path or use one of [c4, wikitext2, ptb, pajama, none]",
+                "Check data path or use one of [c4, wikitext2, ptb, pajama, openmathreasoning, none]",
             )
     else:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -7192,10 +7410,12 @@ def get_loaders(
             data = get_c4(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
         elif name.lower() == "c4_new":
             data = get_c4_new(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
+        elif name.lower() == "openmathreasoning":
+            data = get_openmathreasoning(nsamples, seqlen, tokenizer, eval_mode=eval_mode)
         else:
             raise ValueError(
                 f"Failed to load data from {name}.",
-                "Check dataset name or path or use one of [c4, wikitext2, ptb, pajama, none]",
+                "Check dataset name or path or use one of [c4, wikitext2, ptb, pajama, openmathreasoning, none]",
             )
 
     if hasattr(data, "input_ids"):
@@ -7276,6 +7496,195 @@ def evaluate_perplexity(
         torch.distributed.all_reduce(total_nll_and_tokens, op=torch.distributed.ReduceOp.SUM)
     ppl = torch.exp(total_nll / total_tokens)
     return ppl.item()
+```
+
+### `src/entropy_utils.py`
+
+```python
+import torch
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from typing import Optional
+
+class EntropyMasker:
+    """
+    一个用于生成和管理熵 mask 的单例类。
+    在整个项目中，应该只使用本文件末尾创建的 `entropy_masker` 实例。
+    """
+    def __init__(self):
+        """
+        初始化。不做任何重量级操作，仅设置占位符。
+        应在之后调用 .configure() 方法来设置参数和加载模型。
+        """
+        self.model = None
+        self.tokenizer = None
+        self.device = None
+        self.fixed_threshold = None
+        self.percentile_threshold = None
+        self.current_mask: Optional[torch.Tensor] = None
+
+    def configure(
+        self,
+        model_name: str, 
+        device: Optional[str] = None,
+        fixed_threshold: Optional[float] = None,
+        percentile_threshold: Optional[float] = None
+    ):
+        """
+        配置 masker，加载模型、Tokenizer 并设置一个或多个熵阈值。
+
+        Args:
+            model_name (str): 要加载的 Hugging Face 模型名称或路径。
+            device (str, optional): 指定运行模型的设备 ('cuda', 'cpu', etc.)。
+                                    如果为 None，则自动检测。
+            fixed_threshold (Optional[float]): 固定的熵值阈值。熵值大于此值的 token 会被考虑。
+                                               如果为 None，则不使用此标准。
+            percentile_threshold (Optional[float]): 百分位阈值。熵值排在前 (1-value)*100% 的 token 会被考虑。
+                                                     例如, 0.8 意味着考虑熵最高的20%的token。
+                                                     如果为 None，则不使用此标准。
+        """
+        print(f"正在配置 EntropyMasker 并加载模型: {model_name}...")
+        
+        if device is None:
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        else:
+            self.device = device
+            
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.model = AutoModelForCausalLM.from_pretrained(model_name).to(self.device)
+            self.model.eval() # 确保模型处于评估模式
+            print(f"模型已成功加载到设备: {self.device}")
+        except Exception as e:
+            print(f"加载模型失败: {e}")
+            print("请确保您已安装 'transformers' 库并且可以访问 Hugging Face Hub。")
+            raise
+
+        # 配置阈值
+        if fixed_threshold is None and percentile_threshold is None:
+            raise ValueError("必须提供至少一个阈值 ('fixed_threshold' 或 'percentile_threshold')。")
+        if percentile_threshold is not None and not (0.0 <= percentile_threshold <= 1.0):
+            raise ValueError("percentile_threshold 必须在 0.0 和 1.0 之间。")
+            
+        self.fixed_threshold = fixed_threshold
+        self.percentile_threshold = percentile_threshold
+        print(f"熵阈值已配置: fixed={self.fixed_threshold}, percentile={self.percentile_threshold}")
+
+    @torch.no_grad()
+    def generate_and_set_mask(
+        self,
+        token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        计算、设置并返回熵 mask。
+        如果同时配置了两种阈值，则返回它们的交集。
+
+        Args:
+            token_ids (torch.Tensor): 输入的 token ID 序列，形状应为 [1, seq_len] 或 [seq_len]。
+
+        Returns:
+            torch.Tensor: 一个布尔类型的 mask 张量，形状与输入的 token_ids 完全相同。
+                          True 表示高熵位置，False 表示低熵位置。
+        """
+        if self.model is None or self.tokenizer is None:
+            raise RuntimeError("必须先调用 .configure() 方法才能生成 mask。")
+
+        # 1. 获取模型输出的 logits
+        if token_ids.dim() == 1:
+            token_ids = token_ids.unsqueeze(0)
+        token_ids = token_ids.to(self.device)
+        
+        outputs = self.model(token_ids)
+        # Logits 的形状为 [batch_size, sequence_length, vocab_size]
+        # 每个位置的 logit 对应于对下一个 token 的预测，我们用它来评估当前位置 token 的不确定性
+        logits = outputs.logits
+
+        # 2. 计算熵
+        probs = F.softmax(logits, dim=-1)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-9), dim=-1)
+        
+        # 3. 根据类实例的阈值配置生成 mask
+        final_mask = torch.ones_like(entropy, dtype=torch.bool)
+        
+        if self.fixed_threshold is not None:
+            final_mask &= (entropy > self.fixed_threshold)
+            
+        if self.percentile_threshold is not None:
+            quantile_value = torch.quantile(entropy.to(torch.float32), self.percentile_threshold)
+            final_mask &= (entropy >= quantile_value)
+        
+        # 4. 设置 (set) 内部 mask 并返回
+        self.current_mask = final_mask
+        return self.current_mask
+
+    def get_mask(self) -> Optional[torch.Tensor]:
+        """
+        获取最近一次生成的 mask。
+
+        Returns:
+            Optional[torch.Tensor]: 返回存储的 mask，如果还未生成则为 None。
+        """
+        return self.current_mask
+
+# ==============================================================================
+# 全局单例
+# ==============================================================================
+# 在整个项目中，都应该导入并使用这个实例
+entropy_masker = EntropyMasker()
+
+
+# ==============================================================================
+# 示例用法
+# ==============================================================================
+if __name__ == '__main__':
+    model_name = "gpt2"
+    
+    # 准备一个输入序列
+    # 注意：tokenizer 需要在 configure 之后才能使用
+    temp_tokenizer = AutoTokenizer.from_pretrained(model_name)
+    text = "The quick brown fox jumps over the lazy dog. This sentence contains all letters of the alphabet."
+    token_ids = temp_tokenizer.encode(text, return_tensors="pt")
+    seq_len = token_ids.shape[1]
+    
+    # --- 示例 1: 仅使用百分比阈值 ---
+    print(f"\n--- 示例 1: 配置并使用 'percentile' 阈值 ---")
+    entropy_masker.configure(
+        model_name=model_name,
+        percentile_threshold=0.8
+    )
+    
+    mask1 = entropy_masker.generate_and_set_mask(token_ids)
+    print(f"Token 序列长度: {seq_len}")
+    print(f"生成的 Mask 形状: {mask1.shape}")
+    print(f"被标记为高熵的 Token 数量: {mask1.sum().item()}")
+    print(f"高熵 Token 的比例: {mask1.sum().item() / seq_len:.2%}")
+
+    # 使用 get_mask() 验证
+    retrieved_mask1 = entropy_masker.get_mask()
+    print(f"通过 get_mask() 获取的数量是否一致: {retrieved_mask1.sum().item() == mask1.sum().item()}")
+
+
+    # --- 示例 2: 重新配置并仅使用固定阈值 ---
+    print(f"\n--- 示例 2: 重新配置并使用 'fixed' 阈值 ---")
+    entropy_masker.configure(
+        model_name=model_name,
+        fixed_threshold=2.5
+    )
+    mask2 = entropy_masker.generate_and_set_mask(token_ids)
+    print(f"生成的 Mask 形状: {mask2.shape}")
+    print(f"被标记为高熵的 Token 数量: {mask2.sum().item()}")
+
+
+    # --- 示例 3: 重新配置并同时使用两种阈值 ---
+    print(f"\n--- 示例 3: 重新配置并同时使用 'percentile' (top 50%) 和 'fixed' (>2.0) 阈值 ---")
+    entropy_masker.configure(
+        model_name=model_name,
+        percentile_threshold=0.5, # 保留熵最高的 50%
+        fixed_threshold=2.0        # 并且熵必须大于 2.0
+    )
+    mask3 = entropy_masker.generate_and_set_mask(token_ids)
+    print(f"生成的 Mask 形状: {mask3.shape}")
+    print(f"被标记为高熵的 Token 数量: {mask3.sum().item()}")
 ```
 
 ### `src/finetune.py`
